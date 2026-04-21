@@ -9,8 +9,18 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
+/*
+ * [수정 내역 - ObjectLoopSplat]
+ * 1. dL_dtau (Pose Gradient) 관련 로직을 제거
+ *    - ObjectLoopSplat은 PyTorch 레벨에서 포즈 최적화를 수행하므로, CUDA 커널 내의 복잡한 포즈 미분 계산이 불필요
+ * 2. 시맨틱(Semantic) 및 깊이(Depth) 피처의 역전파 로직을 통합
+ *    - SemGaussSLAM의 구현을 참고하여 sh_sems 및 dL_dalpha 로직을 추가
+ *    - 이를 통해 시맨틱 레이블 및 투명도에 대한 최적화가 가능
+ */
+
 #include "backward.h"
 #include "auxiliary.h"
+#include "math.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -136,6 +146,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	// that is caused because the mean affects the view-dependent color.
 	// Additional mean gradient is accumulated in below methods.
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
+
 }
 
 // Backward version of INVERSE 2D covariance matrix computation
@@ -353,11 +364,13 @@ __global__ void preprocessCUDA(
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
 	const float scale_modifier,
+	const float* view,
 	const float* proj,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
+	float* dL_ddepth,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
@@ -386,6 +399,21 @@ __global__ void preprocessCUDA(
 	// of cov2D and following SH conversion also affects it.
 	dL_dmeans[idx] += dL_dmean;
 
+	// the w must be equal to 1 for view^T * [x,y,z,1]
+	float3 m_view = transformPoint4x3(m, view);
+	
+	// Compute loss gradient w.r.t. 3D means due to gradients of depth
+	// from rendering procedure
+	glm::vec3 dL_dmean2;
+	float mul3 = view[2] * m.x + view[6] * m.y + view[10] * m.z + view[14];
+	dL_dmean2.x = (view[2] - view[3] * mul3) * dL_ddepth[idx];
+	dL_dmean2.y = (view[6] - view[7] * mul3) * dL_ddepth[idx];
+	dL_dmean2.z = (view[10] - view[11] * mul3) * dL_ddepth[idx];
+	
+	// That's the third part of the mean gradient.
+	dL_dmeans[idx] += dL_dmean2;
+
+
 	// Compute gradient updates due to computing colors from SHs
 	if (shs)
 		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
@@ -407,13 +435,17 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
-	const float* __restrict__ final_Ts,
+	const float* __restrict__ depths,
+	const float* __restrict__ accum_alphas,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixel_depths,
+	const float* __restrict__ dL_dpixel_alphas,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_ddepths,
 	// semantic
 	const float* __restrict__ semantics,
 	const float* __restrict__ dL_dpixels_sems,
@@ -441,13 +473,14 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_depths[BLOCK_SIZE];
 
 	// semantic
 	__shared__ float collected_semantics[L * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
-	const float T_final = inside ? final_Ts[pix_id] : 0;
+	const float T_final = inside ? (1 - accum_alphas[pix_id]) : 0;
 	float T = T_final;
 
 	// We start from the back. The ID of the last contributing
@@ -456,20 +489,28 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_red = 0;
+	float accum_rea = 0;
 	float dL_dpixel[C];
+	float dL_dpixel_depth;
+	float dL_dpixel_alpha;
 	// semantic
 	float accum_rec_sem[L] = { 0 };
 	float dL_dpixel_sem[L];
 
-	if (inside)
+	if (inside) {
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		dL_dpixel_depth = dL_dpixel_depths[pix_id];
+		dL_dpixel_alpha = dL_dpixel_alphas[pix_id];
 		// semantic
 		for (int i = 0; i < L; i++)
 			dL_dpixel_sem[i] = dL_dpixels_sems[i * H * W + pix_id];
+	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_depth = 0;
 	// semantic
     float last_semantic[L] = { 0 };
 
@@ -493,6 +534,7 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			collected_depths[block.thread_rank()] = depths[coll_id];
 		    // semantic
 		    for (int i = 0; i < L; i++)
 				collected_semantics[i * BLOCK_SIZE + block.thread_rank()] = semantics[coll_id * L + i];
@@ -524,6 +566,7 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
+			const float dpixel_depth_ddepth = alpha * T;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
@@ -544,7 +587,18 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
-			// semantic
+			const float dep = collected_depths[j];
+			accum_red = last_alpha * last_depth + (1.f - last_alpha) * accum_red;
+			last_depth = dep;
+			dL_dalpha += (dep-accum_red) * dL_dpixel_depth;
+			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
+			
+			accum_rea = last_alpha + (1.f - last_alpha) * accum_rea;
+			// dL_dalpha: 가우시안의 투명도(opacity)가 최종 픽셀 값들에 미치는 영향력을 합산함.
+			// SemGaussSLAM에서 추가된 로직으로, 컬러/깊이/시맨틱의 차이를 통해 투명도를 정교하게 최적화하는 데 사용됨.
+			dL_dalpha += (1 - accum_rea) * dL_dpixel_alpha;
+
+			// 시맨틱(Semantic) 피처에 대한 그래디언트 전파
 			for (int ch = 0; ch < L; ch++)
 			{
 				const float l = collected_semantics[ch * BLOCK_SIZE + j];
@@ -610,15 +664,13 @@ void BACKWARD::preprocess(
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
+	float* dL_ddepth,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
-	// Somewhat long, thus it is its own kernel rather than being part of 
-	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
 	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		means3D,
@@ -645,15 +697,17 @@ void BACKWARD::preprocess(
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
+		viewmatrix,
 		projmatrix,
 		campos,
 		(float3*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
+		dL_ddepth,
 		dL_dcov3D,
 		dL_dsh,
-		dL_dscale,
-		dL_drot);
+		(glm::vec3*)dL_dscale,
+		(glm::vec4*)dL_drot);
 }
 
 void BACKWARD::render(
@@ -665,13 +719,17 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
-	const float* final_Ts,
+	const float* depths,
+	const float* accum_alphas,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixel_depths,
+	const float* dL_dpixel_alphas,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
+	float* dL_ddepths,
 	// semantic
 	const float* semantics,
 	const float* dL_dpixels_sems,
@@ -685,13 +743,17 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
-		final_Ts,
+		depths,
+		accum_alphas,
 		n_contrib,
 		dL_dpixels,
+		dL_dpixel_depths,
+		dL_dpixel_alphas,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
+		dL_ddepths,
 		// semantic
 		semantics,
 		dL_dpixels_sems,

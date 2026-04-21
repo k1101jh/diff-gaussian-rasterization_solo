@@ -9,6 +9,12 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
+/*
+ * [ObjectLoopSplat 수정 내역]
+ * - RasterizeGaussiansBackwardCUDA에서 dL_dtau (포즈 그래디언트) 파라미터를 제거함.
+ * - 시맨틱 임베딩(sh_sems) 및 가우시안 투명도 변화량(dL_dalpha) 로직을 통합함.
+ */
+
 #include <math.h>
 #include <torch/extension.h>
 #include <cstdio>
@@ -32,7 +38,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -53,13 +59,19 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	// semantic
-	const torch::Tensor& sh_sems)
+	const torch::Tensor& sh_sems,
+	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
   const int P = means3D.size(0);
+
+  if (sh_sems.size(0) != 0) {
+    TORCH_CHECK(sh_sems.size(0) == P, "sh_sems must have same number of points as means3D");
+    TORCH_CHECK(sh_sems.size(1) == NUM_LABELS, "sh_sems must have NUM_LABELS channels (", NUM_LABELS, ")");
+  }
   const int H = image_height;
   const int W = image_width;
 
@@ -72,6 +84,7 @@ RasterizeGaussiansCUDA(
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
+  torch::Tensor out_alpha = torch::full({1, H, W}, 0.0, float_opts);
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -114,13 +127,15 @@ RasterizeGaussiansCUDA(
 		prefiltered,
 		out_color.contiguous().data<float>(),
 		out_depth.contiguous().data<float>(),
+		out_alpha.contiguous().data<float>(),
         // semantic
 		sh_sems.contiguous().data_ptr<float>(),
 		out_semantics.contiguous().data<float>(),
-		radii.contiguous().data<int>());
+		radii.contiguous().data<int>(),
+		debug);
   }
   // semantic
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_semantics);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_alpha, out_semantics);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -138,6 +153,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx,
 	const float tan_fovy,
     const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_depth, // Added for loop_splat compatibility
+    const torch::Tensor& dL_dout_alpha, // Added for loop_splat compatibility
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
@@ -163,6 +180,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
+  auto float_opts = means3D.options().dtype(torch::kFloat32);
+  torch::Tensor dL_ddepths = torch::zeros({P, 1}, float_opts);
   // semantic
   torch::Tensor dL_dsemantics= torch::zeros({P, NUM_LABELS}, means3D.options());
 
@@ -194,11 +213,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
+	  nullptr, // alpha is not passed explicitly because it's stored in imageBuffer
 	  dL_dout_color.contiguous().data<float>(),
+      dL_dout_depth.contiguous().data<float>(),
+      dL_dout_alpha.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),  
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),
+      dL_ddepths.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),
 	  dL_dcov3D.contiguous().data<float>(),
 	  dL_dsh.contiguous().data<float>(),

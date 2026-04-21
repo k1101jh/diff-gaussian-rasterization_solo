@@ -91,6 +91,8 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
+	// W: viewmatrix의 3x3 rotation 부분 (world→camera 회전)
+	// Vrk가 world space 공분산이므로, W 변환이 필요함: cov2D = (W*J)^T * Vrk * (W*J)
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
@@ -103,12 +105,13 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 		cov3D[1], cov3D[3], cov3D[4],
 		cov3D[2], cov3D[4], cov3D[5]);
 
+	// cov2D = T^T * Vrk * T (Vrk는 대칭 행렬)
 	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
 
-	// Apply low-pass filter: every Gaussian should be at least
-	// one pixel wide/high. Discard 3rd row and column.
+	// 최소 1픽셀 크기 보장 (low-pass filter)
 	cov[0][0] += 0.3f;
 	cov[1][1] += 0.3f;
+
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
@@ -177,7 +180,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered, bool debug)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -193,11 +196,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
-	// Transform point by projecting
+	// 스크린 좌표 계산: p_orig를 projmatrix로 변환
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
-	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	const float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	const float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
@@ -215,17 +218,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
-	// Invert covariance (EWA algorithm)
+	// EWA 알고리즘으로 공분산 역행렬(conic) 계산
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
 		return;
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
-	// Compute extent in screen space (by finding eigenvalues of
-	// 2D covariance matrix). Use extent to compute a bounding rectangle
-	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
+	// 화면 공간 타일 범위(bounding rect) 계산
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
@@ -274,12 +274,16 @@ renderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth,
+	float* __restrict__ out_alpha,
 	// semantic
 	const float* __restrict__ sem_features,
 	float* __restrict__ out_semantics)
 {
 	// 计算当前线程块和水平方向上的线程块数量
 	auto block = cg::this_thread_block();
+	// 디버깅: 커널 시작 확인 (최초 1회)
+	#if !defined(NDEBUG) || defined(DEBUG)
+	#endif
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	// 计算当前处理的图块(tile)的最小和最大坐标。
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -314,8 +318,8 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 	// semantic
     float L[SEMANTICS] = { 0 };	//rendered semantic
-    // 	float D = 0.0f;  // Mean Depth
-    float D = 15.0f;  // Median Depth. TODO: This is a hack setting max_depth to 15
+	float D = 0.0f;  // Mean Depth
+    // float D = 15.0f;  // Median Depth. TODO: This is a hack setting max_depth to 15
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -377,15 +381,15 @@ renderCUDA(
 
 
             // Mean depth:
-//             float dep = collected_depth[j];
-//             D += dep * alpha * T;
+            float dep = collected_depth[j];
+            D += dep * alpha * T;
 
             // Median depth:
-            if (T > 0.5f && test_T < 0.5)
-			{
-			    float dep = collected_depth[j];
-				D = dep;
-			}
+            // if (T > 0.5f && test_T < 0.5)
+			// {
+			//     float dep = collected_depth[j];
+			// 	D = dep;
+			// }
 
 
 			T = test_T;
@@ -405,6 +409,7 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_depth[pix_id] = D;
+		out_alpha[pix_id] = 1.0f - T;
 
 		// semantic
         for (int ch = 0; ch < SEMANTICS; ch++)
@@ -426,6 +431,7 @@ void FORWARD::render(
 	float* out_color,
 	const float* depth,
 	float* out_depth,
+	float* out_alpha,
 	//semantic
 	const float* semantics,
 	float* out_semantics)
@@ -443,6 +449,7 @@ void FORWARD::render(
 		out_color,
 		depth,
 		out_depth,
+		out_alpha,
 		// semantic
 		semantics,
 		out_semantics);
@@ -472,7 +479,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered, bool debug)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -499,6 +506,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		debug
 		);
 }

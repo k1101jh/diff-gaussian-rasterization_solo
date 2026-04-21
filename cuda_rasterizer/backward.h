@@ -29,13 +29,17 @@ namespace BACKWARD
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
-		const float* final_Ts,
+		const float* depths, // from gaussian_rasterizer
+		const float* accum_alphas, // from gaussian_rasterizer
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		const float* dL_dpixel_depths, // from gaussian_rasterizer
+		const float* dL_dpixel_alphas, // from gaussian_rasterizer
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
+		float* dL_ddepths, // from gaussian_rasterizer
 		// semantic
 		const float* semantics,
 		const float* dL_dpixels_sems,
@@ -60,6 +64,7 @@ namespace BACKWARD
 		const float* dL_dconics,
 		glm::vec3* dL_dmeans,
 		float* dL_dcolor,
+		float* dL_ddepth,
 		float* dL_dcov3D,
 		float* dL_dsh,
 		glm::vec3* dL_dscale,

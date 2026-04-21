@@ -30,6 +30,15 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+// CUDA 에러 체크 매크로
+#define cudaSafeCall(err) __cudaSafeCall(err, __FILE__, __LINE__)
+inline void __cudaSafeCall(cudaError_t err, const char *file, const int line) {
+	if (cudaSuccess != err) {
+		fprintf(stderr, "cudaSafeCall() failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
+		exit(-1);
+	}
+}
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -163,9 +172,17 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
-	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
+	
+	// CUB 드라이런 시 nullptr 오프셋 이슈 해결: 
+	// chunk가 nullptr이면 (드라이런) 실제 CUB 호출 시 유효한 메모리 포인터가 필요할 수 있음.
+	// 특히 InclusiveSum의 경우 input/output 포인터가 정렬되어 있지 않으면 에러를 뱉을 수 있음.
+	uint32_t* temp_ptr = (chunk == nullptr) ? (uint32_t*)128 : geom.tiles_touched;
+	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, temp_ptr, temp_ptr, P);
+	
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
+	// 시맨틱 버퍼 추가 (필요 시)
+	obtain(chunk, geom.semantics, P * NUM_LABELS, 128);
 	return geom;
 }
 
@@ -217,19 +234,20 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* out_depth,
+	float* out_alpha,
 	// semantic
 	const float* sh_sems,
 	float* out_semantics,
-	int* radii)
+	int* radii,
+	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-
-    //  1. GeometryState类的fromChunk: 从一块内存中提取几何状态信息并构造GeometryState对象
-    //  2. fromChunk 方法内部: 通过多次调用 obtain 来更新 size 指针的位置，模拟实际的内存分配过程，但实际上并不分配内存
-    //  3. 当 fromChunk 完成后，size 指针会指向模拟分配的尾部。required 函数返回 ((size_t)size) + 128，这是在模拟的内存分配的基础上额外添加了128字节对齐的空间
-    //  这样做是因为 obtain 中的对齐方式可能会在内存块的开始处留下未使用的空间
+	int current_device;
+	cudaGetDevice(&current_device);
+	if (debug) printf("Rasterizer::forward on device %d, P=%d, W=%d, H=%d, fx=%.2f, fy=%.2f, tanx=%.3f, tany=%.3f\n", 
+		current_device, P, width, height, focal_x, focal_y, tan_fovx, tan_fovy);
 
 	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
@@ -243,7 +261,7 @@ int CudaRasterizer::Rasterizer::forward(
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	// 动态调整基于图像的辅助缓冲区大小
+	// Dynamically resize auxiliary image-based buffers
 	int img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
@@ -254,7 +272,6 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
-	// preprocess函数: 对颜色并没有处理，只是如果colors_precomp是空指针，用SH计算颜色(实际上，在slam里面输入相机得到的rgb值)
 	FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -279,24 +296,30 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		debug
 	);
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
-	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
 		geomState.tiles_touched, geomState.point_offsets, P);
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
 	cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
+	if (debug || num_rendered < 0 || num_rendered > 100000000) {
+		printf("num_rendered: %d\n", num_rendered);
+	}
+	if (num_rendered > 100000000) {
+		fprintf(stderr, "Error: num_rendered too large (%d). Possible divergence detected.\n", num_rendered);
+		exit(-1);
+	}
 
 	int binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
-	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -328,7 +351,7 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges
 			);
 
-	// Let each tile blend its range of Gaussians independently in parallel
+	// Blend tiles
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	FORWARD::render(
 		tile_grid, block,
@@ -344,6 +367,7 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		geomState.depths,
 		out_depth,
+		out_alpha,
 		// semantic
 		sh_sems,
 		out_semantics);
@@ -371,12 +395,16 @@ void CudaRasterizer::Rasterizer::backward(
 	const int* radii,
 	char* geom_buffer,
 	char* binning_buffer,
-	char* img_buffer,
+	char* image_buffer,
+	const float* alpha,
 	const float* dL_dpix,
+	const float* dL_dpix_depth,
+	const float* dL_dpix_alpha,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
+	float* dL_ddepth,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_dsh,
@@ -385,11 +413,12 @@ void CudaRasterizer::Rasterizer::backward(
 	// semantic
 	const float* sh_sems,
 	const float* dL_dpix_sem,
-	float* dL_dsemantics)
+	float* dL_dsemantics,
+	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
-	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+	ImageState imgState = ImageState::fromChunk(image_buffer, width * height);
 
 	if (radii == nullptr)
 	{
@@ -404,9 +433,7 @@ void CudaRasterizer::Rasterizer::backward(
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
-	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
-	// semantic
 	const float* sem_ptr = sh_sems;
 
 	BACKWARD::render(
@@ -419,21 +446,23 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.means2D,
 		geomState.conic_opacity,
 		color_ptr,
+		geomState.depths,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		dL_dpix_depth,
+		dL_dpix_alpha,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
+		dL_ddepth,
 		// semantic
 		sem_ptr,
 		dL_dpix_sem,
 		dL_dsemantics);
 
-	// Take care of the rest of preprocessing. Was the precomputed covariance
-	// given to us or a scales/rot pair? If precomputed, pass that. If not,
-	// use the one we computed ourselves.
+	// Take care of the rest of preprocessing.
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 	BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
@@ -453,6 +482,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dconic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
+		dL_ddepth,
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
